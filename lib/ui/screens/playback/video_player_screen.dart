@@ -34,6 +34,7 @@ import '../../widgets/image_source.dart';
 import '../../widgets/player_volume_control.dart';
 import '../../widgets/playback/playback_time_row.dart';
 import '../../widgets/playback/player_logo.dart';
+import '../../widgets/playback/remote_scrub_badge.dart';
 import '../../widgets/playback/seek_icons.dart';
 import '../../widgets/playback/track_picker.dart';
 import '../../widgets/playback/trickplay.dart';
@@ -48,6 +49,7 @@ import '../../../playback/playback_lifecycle_handler.dart';
 import '../../../playback/playback_info_sections.dart';
 import '../../../playback/hdr_stream_capability.dart';
 import '../../../playback/cinema_skip_controller.dart';
+import '../../../playback/remote_scrub_controller.dart';
 import '../../../data/models/aggregated_item.dart';
 import '../../../data/models/calendar_entry.dart';
 import '../../../data/models/upcoming_episode_info.dart';
@@ -368,6 +370,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   MediaSegment? _skipSegment;
   Duration? _skipTo;
   late final CinemaSkipController _cinemaSkip;
+  late final RemoteScrubController _remoteScrub;
   StreamSubscription<Duration>? _cinemaSkipDurationSub;
 
   /// True when the auto-hide setting is on for the current segment.
@@ -763,6 +766,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     _configureCinemaSkip();
     _syncCinemaSkip();
     _cinemaSkip.addListener(_onCinemaSkipChanged);
+    _remoteScrub = RemoteScrubController(
+      position: () => _scrubBasePosition,
+      duration: () => _state.duration,
+      onMove: _onRemoteScrubMove,
+    )..addListener(() {
+        if (mounted) setState(() {});
+      });
     _cinemaSkipDurationSub = _state.durationStream.listen(
       (_) => _syncCinemaSkip(),
     );
@@ -923,6 +933,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       }
     }
     _queueSub = _queue.queueChangedStream.listen((_) {
+      if (_remoteScrub.isScrubbing) _dropScrubSession(resume: false);
       _closeEpisodeBrowser();
       _loadSegmentsForCurrentItem();
       unawaited(_loadNextAirDate());
@@ -1148,6 +1159,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       _manager.stop(userInitiated: false);
     }
     unawaited(_restoreSystemUiForExit());
+    _remoteScrub.dispose();
     super.dispose();
   }
 
@@ -1448,6 +1460,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   void didChangeAppLifecycleState(AppLifecycleState lifecycleState) {
     if (lifecycleState != AppLifecycleState.resumed) {
       _cancelTemporarySpeed();
+    }
+    if ((lifecycleState == AppLifecycleState.paused ||
+            lifecycleState == AppLifecycleState.hidden) &&
+        _remoteScrub.isScrubbing) {
+      // No resume: it would race the player's release on Android TV.
+      _dropScrubSession(resume: false);
     }
     switch (lifecycleState) {
       case AppLifecycleState.inactive:
@@ -2281,6 +2299,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   }
 
   bool _areSeekPromptsSuppressed() {
+    if (_remoteScrub.isScrubbing) return true;
     final until = _suppressSeekPromptsUntil;
     if (until == null) return false;
     return DateTime.now().isBefore(until);
@@ -2949,7 +2968,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       if (!mounted) return;
       // Closing a dialog gives focus back to the button that opened it, so the
       // controls stay up while one is open.
-      if (_routeCovered) {
+      if (_routeCovered || _remoteScrub.isScrubbing) {
         _scheduleHide(delay: hideDelay);
         return;
       }
@@ -3099,6 +3118,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   }
 
   bool _dismissControlsOrOverlays() {
+    if (_remoteScrub.isScrubbing) {
+      // The player was never seeked, so dropping the session returns to where
+      // the scrub started, and resumes if it was playing.
+      _dropScrubSession(resume: true);
+      _suppressBackNavigation(duration: const Duration(milliseconds: 500));
+      return true;
+    }
     if (_isCinemaSkipVisible) {
       _dismissCinemaSkip();
       return true;
@@ -3133,6 +3159,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   }
 
   void _dropScrubSession({required bool resume}) {
+    _remoteScrub.stop();
     if (_pendingScrubSeekTarget == null &&
         !_isPausedScrubActive &&
         !_isSeeking) {
@@ -3168,14 +3195,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   void _seekRelativeAccumulate(int ms) {
     _noteViewerActivity();
     _suppressSeekPrompts();
-    // While a released commit is still converging, the pending target is
-    // already null but _state.position still reads pre-seek - basing a quick
-    // follow-up press on it would jump back to the old position.
-    final basePosition =
-        _pendingScrubSeekTarget ??
-        (_isSeeking ? _lastScrubCommitTarget : null) ??
-        _transportPosition;
-    final target = basePosition + Duration(milliseconds: ms);
+    final target = _scrubBasePosition + Duration(milliseconds: ms);
     _prefetchTrickplayDirectional(target, forward: ms > 0);
     _accumulateScrub(target);
   }
@@ -3251,8 +3271,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
   /// Commits whatever scrub target is pending as the one real seek for this
   /// session. Called on Slider drag-end and on play during a paused D-pad
-  /// scrub session - the actual "go" signals, not a timer guess.
+  /// scrub session - the actual "go" signals, not a timer guess. Also on OK,
+  /// Play or Pause during a speed-levels scrub.
   void _commitPendingScrub() {
+    _remoteScrub.stop();
     _noteViewerActivity();
     _isPausedScrubActive = false;
     final pendingTarget = _pendingScrubSeekTarget;
@@ -3475,6 +3497,79 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     _seekRepeatCount = 0;
   }
 
+  bool get _useSpeedLevels =>
+      PlatformDetection.isTV &&
+      PlatformDetection.isAndroid &&
+      _prefs.get(UserPreferences.remoteScrubSpeedLevels);
+
+  // While a released commit is still converging, the pending target is
+  // already null but _state.position still reads pre-seek - basing a quick
+  // follow-up press on it would jump back to the old position.
+  Duration get _scrubBasePosition =>
+      _pendingScrubSeekTarget ??
+      (_isSeeking ? _lastScrubCommitTarget : null) ??
+      _transportPosition;
+
+  void _onRemoteScrubMove(Duration target) {
+    _suppressSeekPrompts();
+    _prefetchTrickplayDirectional(
+      target,
+      forward: _remoteScrub.direction != RemoteScrubDirection.backward,
+    );
+    _accumulateScrub(target, showControls: false);
+    // A prompt can hide the controls during the hold delay.
+    if (!_controlsVisible) _showControls(focusSeekbar: true);
+  }
+
+  KeyEventResult? _handleSpeedLevelsKey(
+    KeyEvent event, {
+    required bool fromSeekbar,
+  }) {
+    if (!_useSpeedLevels || _showNextUp) return null;
+    final action = _remoteScrub.handleKey(
+      event,
+      fromSeekbar: fromSeekbar,
+      controlsVisible: _controlsVisible,
+      skipButtonFocused:
+          FocusManager.instance.primaryFocus == _tvSkipSegmentFocus,
+    );
+    switch (action) {
+      case RemoteScrubAction.none:
+        return null;
+      case RemoteScrubAction.consume:
+        if (_controlsVisible) _scheduleHide();
+        return KeyEventResult.handled;
+      case RemoteScrubAction.revealControls:
+        _showControls(focusSeekbar: true);
+        return KeyEventResult.handled;
+      case RemoteScrubAction.clickFromHidden:
+      case RemoteScrubAction.clickOnSeekbar:
+        final forward =
+            _remoteScrub.lastPressDirection == RemoteScrubDirection.forward;
+        final ms = forward
+            ? _prefs.get(UserPreferences.skipForwardLength)
+            : -_prefs.get(UserPreferences.skipBackLength);
+        if (action == RemoteScrubAction.clickFromHidden) {
+          _seekRelative(ms, showControls: false);
+        } else {
+          _seekRelativeAccumulate(ms);
+        }
+        return null;
+      case RemoteScrubAction.finishPlay:
+      case RemoteScrubAction.finishPause:
+        // OK and Play play from the target; Pause commits and stays paused.
+        final play = action == RemoteScrubAction.finishPlay;
+        _wasPlayingBeforeScrubPause = play;
+        _commitPendingScrub();
+        if (play) {
+          _showControls();
+        } else {
+          _manager.pause();
+        }
+        return KeyEventResult.handled;
+    }
+  }
+
   SubtitleViewConfiguration _buildSubtitleConfig() =>
       buildSubtitleViewConfiguration(
         context: context,
@@ -3648,12 +3743,15 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       if (PlatformDetection.isTV && _controlsVisible && !_isOsdLocked) {
         _scheduleHide();
       }
+      final speedLevels = _handleSpeedLevelsKey(event, fromSeekbar: false);
+      if (speedLevels != null) return speedLevels;
       if (event.logicalKey == LogicalKeyboardKey.arrowLeft ||
           event.logicalKey == LogicalKeyboardKey.arrowRight) {
         _resetSeekAcceleration();
         // While the preview holds a paused frame the session survives
         // key-release and play is what commits. Otherwise release commits
-        // directly.
+        // directly. In the speed levels style a click skips on release and a
+        // running scrub survives release.
         if (!_pauseDuringScrub) {
           _commitPendingScrub();
         }
@@ -3663,6 +3761,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
       return KeyEventResult.ignored;
     }
+
+    final speedLevels = _handleSpeedLevelsKey(event, fromSeekbar: false);
+    if (speedLevels != null) return speedLevels;
 
     if (PlatformDetection.isTV) {
       final temporarySpeedResult = _handleTvTemporarySpeedKeyDownOrRepeat(
@@ -5003,15 +5104,20 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     required String center,
     required String right,
     bool bold = false,
+    Widget? overlay,
   }) {
+    // An overlay takes the centre slot.
+    final row = PlaybackTimeRow(
+      left: left,
+      center: overlay == null ? center : '',
+      right: right,
+      bold: bold,
+    );
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: AppSpacing.spaceLg),
-      child: PlaybackTimeRow(
-        left: left,
-        center: center,
-        right: right,
-        bold: bold,
-      ),
+      child: overlay == null
+          ? row
+          : Stack(alignment: Alignment.center, children: [row, overlay]),
     );
   }
 
@@ -5308,6 +5414,15 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                           child: Focus(
                             focusNode: _tvSeekbarFocus,
                             onKeyEvent: (node, event) {
+                              // A release bubbles to the screen's handler,
+                              // so the scrub hears it once.
+                              if (event is! KeyUpEvent) {
+                                final speedLevels = _handleSpeedLevelsKey(
+                                  event,
+                                  fromSeekbar: true,
+                                );
+                                if (speedLevels != null) return speedLevels;
+                              }
                               if (!PlatformDetection.isTV ||
                                   (event is! KeyDownEvent &&
                                       event is! KeyRepeatEvent)) {
@@ -5390,6 +5505,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                             duration: duration,
                             use24Hour: use24Hour,
                           ),
+                          // The badge goes under the preview when it shows a
+                          // thumbnail, here otherwise.
+                          overlay:
+                              _remoteScrub.isScrubbing &&
+                                  _seekPreviewTarget() == null
+                              ? _remoteScrubBadge()
+                              : null,
                         ),
                       ],
                     );
@@ -5487,6 +5609,31 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     if (_hoverPosition != null) setState(() => _hoverPosition = null);
   }
 
+  /// The position and tile the seek preview shows, or null while it shows
+  /// nothing.
+  ({Duration position, TrickplayTile tile})? _seekPreviewTarget() {
+    final trickplayMode = _prefs.get(UserPreferences.trickPlayMode);
+    final coverActive = _isSeeking && trickplayMode == TrickplayMode.full;
+    final hoverActive =
+        !_isSeeking &&
+        PlatformDetection.useDesktopUi &&
+        _hoverPosition != null &&
+        trickplayMode != TrickplayMode.disabled &&
+        trickplayMode != TrickplayMode.full;
+    final position = _isSeeking
+        ? Duration(milliseconds: _seekValue.round())
+        : (hoverActive ? _hoverPosition : null);
+    if (position == null || coverActive) return null;
+    final tile = _getTrickplayTile(position);
+    return tile == null ? null : (position: position, tile: tile);
+  }
+
+  Widget _remoteScrubBadge() => RemoteScrubBadge(
+    direction: _remoteScrub.direction!,
+    level: _remoteScrub.level,
+    atEnd: _remoteScrub.atEnd,
+  );
+
   Widget _buildTrickplaySeekPreview() {
     return StreamBuilder<Duration>(
       stream: _state.durationStream,
@@ -5495,22 +5642,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         final duration = durSnap.data ?? Duration.zero;
         final durationMs = math.max(duration.inMilliseconds, 1).toDouble();
         final trickplayMode = _prefs.get(UserPreferences.trickPlayMode);
-        final coverActive = _isSeeking && trickplayMode == TrickplayMode.full;
-        final hoverActive =
-            !_isSeeking &&
-            PlatformDetection.useDesktopUi &&
-            _hoverPosition != null &&
-            trickplayMode != TrickplayMode.disabled &&
-            trickplayMode != TrickplayMode.full;
-        final previewPosition = _isSeeking
-            ? Duration(milliseconds: _seekValue.round())
-            : (hoverActive ? _hoverPosition : null);
-        final previewTile = previewPosition != null && !coverActive
-            ? _getTrickplayTile(previewPosition)
-            : null;
-        if (previewTile == null || previewPosition == null) {
-          return const SizedBox.shrink();
-        }
+        final target = _seekPreviewTarget();
+        if (target == null) return const SizedBox.shrink();
+        final previewPosition = target.position;
+        final previewTile = target.tile;
 
         return LayoutBuilder(
           builder: (context, constraints) {
@@ -5604,22 +5739,48 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       child: previewWidget,
     );
 
+    final preview = SizedBox(
+      width: trackWidth > 0 ? trackWidth : null,
+      height: previewHeight,
+      child: allowOverflow
+          ? OverflowBox(
+              minWidth: 0,
+              maxWidth: double.infinity,
+              alignment: Alignment.topLeft,
+              child: positioned,
+            )
+          : Align(alignment: Alignment.topLeft, child: positioned),
+    );
+
+    // While a remote scrub runs, its speed badge sits under the thumbnail that
+    // marks the position, and the area grows by its height, so the thumbnail
+    // lifts instead of the badge covering the seek bar.
+    final scrubbing = _remoteScrub.isScrubbing;
+    final mainCenter =
+        plan.leftOffset +
+        plan.leftCount * (plan.tileWidth + spacing) +
+        plan.tileWidth / 2;
+
     return Padding(
       padding: const EdgeInsets.only(bottom: AppSpacing.spaceSm),
       child: Transform.translate(
         offset: Offset(0, -verticalTravel),
-        child: SizedBox(
-          width: trackWidth > 0 ? trackWidth : null,
-          height: previewHeight,
-          child: allowOverflow
-              ? OverflowBox(
-                  minWidth: 0,
-                  maxWidth: double.infinity,
-                  alignment: Alignment.topLeft,
-                  child: positioned,
-                )
-              : Align(alignment: Alignment.topLeft, child: positioned),
-        ),
+        child: !scrubbing
+            ? preview
+            : Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  preview,
+                  SizedBox(
+                    width: trackWidth > 0 ? trackWidth : null,
+                    height: RemoteScrubBadge.size,
+                    child: Transform.translate(
+                      offset: Offset(mainCenter - trackWidth / 2, 0),
+                      child: Center(child: _remoteScrubBadge()),
+                    ),
+                  ),
+                ],
+              ),
       ),
     );
   }

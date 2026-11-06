@@ -2892,6 +2892,13 @@ class UserPreferences extends ChangeNotifier {
     defaultValue: 30000,
   );
 
+  // On a TV remote, holding Left or Right scrubs at speed levels. Off, holding
+  // repeats the skip.
+  static final remoteScrubSpeedLevels = Preference(
+    key: 'remote_scrub_speed_levels',
+    defaultValue: true,
+  );
+
   static final unpauseRewindDuration = Preference(
     key: 'unpauseRewindDuration',
     defaultValue: 0,

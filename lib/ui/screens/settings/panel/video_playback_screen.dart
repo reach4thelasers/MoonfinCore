@@ -174,6 +174,13 @@ class _VideoPlaybackScreen extends StatelessWidget {
                   60000: l10n.settingsSixtySeconds,
                 },
               ),
+              if (PlatformDetection.isTV && PlatformDetection.isAndroid)
+                SwitchPreferenceTile(
+                  preference: UserPreferences.remoteScrubSpeedLevels,
+                  title: l10n.remoteScrubSpeedLevels,
+                  subtitle: l10n.remoteScrubSpeedLevelsDescription,
+                  icon: Icons.speed,
+                ),
               SwitchPreferenceTile(
                 preference: UserPreferences.showChapterMarkers,
                 title: l10n.showChapterMarkers,

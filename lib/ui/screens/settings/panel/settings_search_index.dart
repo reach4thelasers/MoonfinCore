@@ -1619,6 +1619,12 @@ List<_SettingsSearchEntry> _buildSettingsSearchIndex({
     video.leaf('skipForwardLength', l10n.skipForwardLength, keywords: [
       'seek forward',
     ]),
+    if (PlatformDetection.isTV && PlatformDetection.isAndroid)
+      video.leaf(
+        'remote_scrub_speed_levels',
+        l10n.remoteScrubSpeedLevels,
+        keywords: ['scrub', 'hold', 'fast forward', 'rewind'],
+      ),
     video.leaf(
       'showChapterMarkers',
       l10n.showChapterMarkers,

@@ -106,6 +106,7 @@ class SettingsPreviewController extends ChangeNotifier {
     'showDescriptionOnPause': SettingsPreviewScene.player,
     'skipBackLength': SettingsPreviewScene.player,
     'skipForwardLength': SettingsPreviewScene.player,
+    'remote_scrub_speed_levels': SettingsPreviewScene.player,
     'showChapterMarkers': SettingsPreviewScene.player,
     'osdLockEnabled': SettingsPreviewScene.player,
     'pref_player_transport_position': SettingsPreviewScene.player,

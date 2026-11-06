@@ -22,10 +22,12 @@ import 'package:moonfin/data/services/theme_music_service.dart';
 import 'package:moonfin/l10n/app_localizations.dart';
 import 'package:moonfin/platform/pip_service.dart';
 import 'package:moonfin/playback/playback_lifecycle_handler.dart';
+import 'package:moonfin/playback/remote_scrub_controller.dart';
 import 'package:moonfin/preference/preference_constants.dart';
 import 'package:moonfin/preference/user_preferences.dart';
 import 'package:moonfin/ui/screens/playback/video_player_screen.dart';
 import 'package:moonfin/ui/screensaver/screensaver_controller.dart';
+import 'package:moonfin/ui/widgets/playback/remote_scrub_badge.dart';
 import 'package:moonfin/ui/widgets/playback/skip_segment_overlay.dart';
 import 'package:moonfin/util/platform_detection.dart';
 
@@ -924,4 +926,221 @@ void main() {
       await tester.pumpWidget(const SizedBox());
     }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
   }
+
+  // Holding Left or Right on an Android TV remote scrubs at speed levels.
+  group('remote scrub on Android TV', () {
+    const holdDelay = RemoteScrubController.holdDelay;
+    final android = TargetPlatformVariant.only(TargetPlatform.android);
+
+    Future<void> mountTv(WidgetTester tester) async {
+      PlatformDetection.setTvMode(true);
+      addTearDown(() => PlatformDetection.setTvMode(false));
+      manager.queueService.setQueue([
+        AggregatedItem(
+          id: 'ep1',
+          serverId: 'server',
+          rawData: const {'Id': 'ep1', 'Type': 'Episode'},
+        ),
+      ]);
+      manager.state.setDuration(const Duration(minutes: 10));
+      manager.state.setPosition(const Duration(minutes: 1));
+      manager.state.setPlaying(true);
+      await mountPlayer(tester);
+    }
+
+    // Focus moves wait for a frame and retry a moment later, so this keeps
+    // frames coming the way playing video does.
+    Future<void> focusFrames(WidgetTester tester) async {
+      for (var i = 0; i < 3; i++) {
+        tester.binding.scheduleFrame();
+        await tester.pump(const Duration(milliseconds: 60));
+      }
+    }
+
+    // Controls hidden, Right held past the hold delay, released, six seconds
+    // of scrubbing at level 1.
+    Future<void> holdRightThenRelease(WidgetTester tester) async {
+      await tester.pump(const Duration(seconds: 6));
+      expect(find.byType(Slider), findsNothing);
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.arrowRight);
+      await focusFrames(tester);
+      await tester.pump(holdDelay - const Duration(milliseconds: 180));
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.arrowRight);
+      await tester.pump(const Duration(seconds: 6));
+    }
+
+    // Catches: release committing; controls hiding mid-scrub; OK seeking to
+    // the wrong place; a pause the setting did not ask for.
+    testWidgets('a hold scrubs, survives release, and OK plays from the target', (
+      tester,
+    ) async {
+      await mountTv(tester);
+      await holdRightThenRelease(tester);
+      expect(manager.seeks, isEmpty);
+      expect(find.byType(Slider), findsOneWidget);
+      expect(find.byType(RemoteScrubBadge), findsOneWidget);
+      expect(manager.transport, isEmpty);
+
+      await tester.sendKeyEvent(LogicalKeyboardKey.select);
+      await tester.pump(const Duration(seconds: 2));
+      expect(manager.seeks, hasLength(1));
+      expect(
+        manager.seeks.single.inMilliseconds,
+        closeTo(
+          const Duration(minutes: 1).inMilliseconds +
+              6000 * RemoteScrubController.speeds[0],
+          RemoteScrubController.tick.inMilliseconds *
+              RemoteScrubController.speeds[0],
+        ),
+      );
+      expect(manager.state.isPlaying, isTrue);
+      expect(find.byType(RemoteScrubBadge), findsNothing);
+      await tester.pumpWidget(const SizedBox());
+    }, variant: android);
+
+    // Catches: a hold started just before the hide timer fires running with
+    // the controls hidden.
+    testWidgets('a hold near the hide time keeps the controls up', (
+      tester,
+    ) async {
+      await mountTv(tester);
+      await tester.pump(const Duration(seconds: 6));
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.arrowRight);
+      await focusFrames(tester);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.arrowRight);
+      await tester.pump();
+      expect(find.byType(Slider), findsOneWidget);
+
+      await tester.pump(const Duration(milliseconds: 4600));
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.arrowRight);
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(find.byType(Slider), findsOneWidget);
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(find.byType(RemoteScrubBadge), findsOneWidget);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.arrowRight);
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.pumpWidget(const SizedBox());
+    }, variant: android);
+
+    // Catches: Back leaving playback; Back committing.
+    testWidgets('Back drops the scrub and stays in the player', (tester) async {
+      await mountTv(tester);
+      await holdRightThenRelease(tester);
+      expect(find.byType(RemoteScrubBadge), findsOneWidget);
+
+      await tester.sendKeyEvent(
+        LogicalKeyboardKey.goBack,
+        physicalKey: PhysicalKeyboardKey.escape,
+      );
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(manager.seeks, isEmpty);
+      expect(find.byType(RemoteScrubBadge), findsNothing);
+      expect(find.byType(Slider), findsOneWidget);
+      expect(manager.state.isPlaying, isTrue);
+      expect(find.byType(VideoPlayerScreen), findsOneWidget);
+      expect(manager.stopCalls, 0);
+      await tester.pumpWidget(const SizedBox());
+    }, variant: android);
+
+    // Catches: clicks lost; a click starting a scrub; a jump on press.
+    testWidgets('a click skips on release, not on press', (tester) async {
+      await mountTv(tester);
+      await tester.pump(const Duration(seconds: 6));
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.arrowRight);
+      await focusFrames(tester);
+      expect(manager.seeks, isEmpty);
+
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.arrowRight);
+      await tester.pump();
+      expect(manager.seeks, [const Duration(seconds: 90)]);
+      expect(find.byType(RemoteScrubBadge), findsNothing);
+      await tester.pumpWidget(const SizedBox());
+    }, variant: android);
+
+    // Catches: the old style changed.
+    testWidgets('with the switch off, holding still repeats the skip', (
+      tester,
+    ) async {
+      await GetIt.instance<UserPreferences>().set(
+        UserPreferences.remoteScrubSpeedLevels,
+        false,
+      );
+      await mountTv(tester);
+      await tester.pump(const Duration(seconds: 6));
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.arrowRight);
+      expect(manager.seeks, [const Duration(seconds: 90)]);
+      // The fake player does not move on a seek, so this does it.
+      manager.state.setPosition(const Duration(seconds: 90));
+      await focusFrames(tester);
+      await tester.sendKeyRepeatEvent(LogicalKeyboardKey.arrowRight);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.arrowRight);
+      await tester.pump(const Duration(seconds: 2));
+      expect(manager.seeks, [
+        const Duration(seconds: 90),
+        const Duration(seconds: 120),
+      ]);
+      await tester.pumpWidget(const SizedBox());
+    }, variant: android);
+
+    // Catches: a hold or click through the skip prompt skipping 30 seconds.
+    testWidgets('the skip prompt keeps its keys', (tester) async {
+      client.items.segments = [
+        segmentJson(id: 'intro', type: 'Intro', startMs: 0, endMs: 90000),
+      ];
+      await mountTv(tester);
+      manager.state.setPosition(const Duration(seconds: 5));
+      await tester.pump();
+      await tester.pump();
+      final skip = tester
+          .widget<SkipSegmentOverlay>(find.byType(SkipSegmentOverlay))
+          .focusNode!;
+      expect(skip.hasPrimaryFocus, isTrue);
+
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.arrowRight);
+      await tester.pump(holdDelay);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.arrowRight);
+      await focusFrames(tester);
+      expect(manager.seeks, isEmpty);
+      expect(find.byType(RemoteScrubBadge), findsNothing);
+      expect(find.byType(Slider), findsOneWidget);
+      await tester.pumpWidget(const SizedBox());
+    }, variant: android);
+
+    // Catches: the release after a hold step not reaching today's release
+    // logic, so the scrub hangs or runs on.
+    testWidgets('a hold that has stepped commits on release', (tester) async {
+      const stepEvery = RemoteScrubController.stepEvery;
+      const speeds = RemoteScrubController.speeds;
+      const margin = Duration(milliseconds: 50);
+      await mountTv(tester);
+      await tester.pump(const Duration(seconds: 6));
+      expect(find.byType(Slider), findsNothing);
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.arrowRight);
+      await focusFrames(tester);
+      // The scrub starts at the hold delay; one step lands a period later.
+      await tester.pump(
+        holdDelay - const Duration(milliseconds: 180) + stepEvery + margin,
+      );
+      expect(manager.seeks, isEmpty);
+      expect(find.byType(RemoteScrubBadge), findsOneWidget);
+
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.arrowRight);
+      await tester.pump(const Duration(seconds: 2));
+      // A whole period at level 1, then a moment at level 2.
+      final expected =
+          const Duration(minutes: 1).inMilliseconds +
+          stepEvery.inSeconds * 1000 * speeds[0] +
+          margin.inMilliseconds * speeds[1];
+      expect(manager.seeks, hasLength(1));
+      expect(
+        manager.seeks.single.inMilliseconds,
+        closeTo(
+          expected.toDouble(),
+          (RemoteScrubController.tick.inMilliseconds * speeds[1]).toDouble(),
+        ),
+      );
+      expect(find.byType(RemoteScrubBadge), findsNothing);
+      await tester.pumpWidget(const SizedBox());
+    }, variant: android);
+  });
 }

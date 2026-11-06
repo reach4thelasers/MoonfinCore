@@ -11065,6 +11065,14 @@
   "settingsFortyFiveSeconds": "45 seconds",
   "settingsSixtySeconds": "60 seconds",
   "settingsSkipForwardLengthDescription": "How many seconds to jump forward after pressing the fast forward button.",
+  "remoteScrubSpeedLevels": "Scrub With Speed Levels",
+  "@remoteScrubSpeedLevels": {
+    "description": "Setting title (TV): holding Left or Right on the remote scrubs at speed levels"
+  },
+  "remoteScrubSpeedLevelsDescription": "Hold left or right to scrub. Press again to go faster, or the other way to slow down. OK plays from there and Back goes back. Off: holding repeats the skip.",
+  "@remoteScrubSpeedLevelsDescription": {
+    "description": "Subtitle for remoteScrubSpeedLevels"
+  },
   "settingsBitstreamAc3ToExternalDecoder": "Bitstream AC3 to external decoder",
   "settingsCinemaMode": "Cinema Mode",
   "settingsCinemaModeSubtitle": "Play trailers/prerolls before a main feature",
